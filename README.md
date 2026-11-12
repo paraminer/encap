@@ -50,7 +50,7 @@ If all 40 slots are occupied, you may need to try again later. Usage resets each
 
 **A small personal note:** I pay for this server out of my own pocket. I want to keep Encap free and accessible, but bandwidth and hosting do cost money. If it helps you and you'd like to support it, I'd genuinely appreciate a donation. It's completely optional and doesn't affect your access.
 
-**Bitcoin:** `YOUR_BITCOIN_ADDRESS_HERE`
+**Bitcoin:** `bc1qy2dxm794pt38xpa6cq772wch3pncsu58s4gtga`
 
 ## Why do some networks block connections?
 
@@ -157,6 +157,10 @@ encap --server https://YOUR_PUBLIC_IP
 ```
 
 Use `--config PATH` if you want to keep a separate local configuration for your server instead of reusing your default registration.
+
+## Feedback and contributions
+
+I'm always open to suggestions and requests for changes. Please open an [issue](https://github.com/paraminer/encap/issues/new) or submit a [pull request](https://github.com/paraminer/encap/pulls).
 
 ## License
 
