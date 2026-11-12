@@ -166,8 +166,6 @@ I'm always open to suggestions and requests for changes. Please open an [issue](
 
 MIT.
 
-## Just remember...
-
-> The closer the collapse of an empire, the crazier its laws.
+Just remember... The closer the collapse of an empire, the crazier its laws.
 
 ![No Fun Allowed](docs/ihatefun.jpg)
