@@ -430,7 +430,7 @@ def sudo_ready(prompt):
         return
     if run(["sudo", "-n", "-v"], check=False, timeout=10).returncode == 0:
         return
-    run(["sudo", "-v", "-p", "  Your Mac password: "], timeout=120)
+    run(["sudo", "-v", "-p", "  Your device password: "], timeout=120)
     if interactive() and not touch_id_sudo():
         sys.stdout.write("\033[1A\r\033[2K")
         sys.stdout.flush()
