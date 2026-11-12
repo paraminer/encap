@@ -58,7 +58,7 @@ else
 import hashlib
 import pathlib
 import sys
-expected = "60b1d3f6ab0dac8628fb6fc1ae0e9c29bbce16eafbf443685003944ac94acc5c"
+expected = "28ef4461d78851f8cc099cbde7e782cc24874c1acf9304a6740b1c183820dbbe"
 actual = hashlib.sha256(pathlib.Path(sys.argv[1]).read_bytes()).hexdigest()
 if actual != expected:
     raise SystemExit("Encap source checksum mismatch")
