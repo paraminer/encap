@@ -19,6 +19,7 @@ import socket
 import stat
 import subprocess
 import sys
+import termios
 import threading
 import time
 import traceback
@@ -39,41 +40,133 @@ class EncapError(Exception):
     pass
 
 
+LOGO = (
+    "   ___ _ __   ___ __ _ _ __",
+    "  / _ \\ '_ \\ / __/ _` | '_ \\",
+    " |  __/ | | | (_| (_| | |_) |",
+    "  \\___|_| |_|\\___\\__,_| .__/",
+    "                      | |",
+    "                      |_|",
+)
+TAGLINE = "private tunnel over https"
+
+
+def color_on(stream=sys.stdout):
+    return stream.isatty() and not os.environ.get("NO_COLOR")
+
+
+def paint(code, text, stream=sys.stdout):
+    return f"\033[{code}m{text}\033[0m" if color_on(stream) else text
+
+
+def dim(text, stream=sys.stdout):
+    return paint("2", text, stream)
+
+
+def interactive():
+    return sys.stdout.isatty() and not DEBUG
+
+
+def banner():
+    if not interactive():
+        return
+    lines = list(LOGO)
+    lines[4] = f"{lines[4]:<29}{dim(TAGLINE)}"
+    print("\n" + "\n".join("  " + line for line in lines) + "\n", flush=True)
+
+
+def clock(seconds):
+    seconds = max(0, int(seconds))
+    hours, rest = divmod(seconds, 3600)
+    return f"{hours}:{rest // 60:02}:{rest % 60:02}" if hours else f"{rest // 60:02}:{rest % 60:02}"
+
+
 def log(level, message):
     if level in ("debug", "info") and not DEBUG:
         return
     labels = {"info": "•", "ok": "✓", "warn": "!", "error": "✗", "debug": "·"}
     colors = {"info": "36", "ok": "32", "warn": "33", "error": "31", "debug": "90"}
     stream = sys.stderr if level in ("warn", "error") else sys.stdout
-    marker = labels[level]
-    if stream.isatty() and not os.environ.get("NO_COLOR"):
-        marker = f"\033[{colors[level]}m{marker}\033[0m"
-    print(f"{marker} {message}", file=stream, flush=True)
+    print(f"  {paint(colors[level], labels[level], stream)} {message}", file=stream, flush=True)
+
+
+def hint(message):
+    print(f"    {dim(message, sys.stderr)}", file=sys.stderr, flush=True)
+
+
+def tunnel_line(opened, server_ip, started, live=False):
+    """One status line: '● Tunnel open  1.2.3.4  02:14' or '○ Tunnel closed  02:14'."""
+    if opened:
+        text = f"  {paint('32', '●')} Tunnel open   {server_ip}   {clock(time.time() - started)}"
+        return text + (f"   {dim('ctrl+c to close')}" if live else "")
+    return f"  {dim('○')} Tunnel closed   {dim(clock(time.time() - started))}"
+
+
+class TerminalGuard:
+    """While connected, hide the cursor and keep ^C and keystrokes from breaking the status line."""
+
+    def __init__(self):
+        self.saved = None
+        self.active = interactive() and sys.stdin.isatty()
+
+    def __enter__(self):
+        if self.active:
+            try:
+                fd = sys.stdin.fileno()
+                self.saved = termios.tcgetattr(fd)
+                quiet = termios.tcgetattr(fd)
+                quiet[3] &= ~(termios.ECHO | termios.ECHOCTL)
+                termios.tcsetattr(fd, termios.TCSANOW, quiet)
+            except (termios.error, OSError):
+                self.saved = None
+            sys.stdout.write("\033[?25l")
+            sys.stdout.flush()
+        return self
+
+    def __exit__(self, *_error):
+        if self.active:
+            if self.saved is not None:
+                try:
+                    termios.tcsetattr(sys.stdin.fileno(), termios.TCSANOW, self.saved)
+                except (termios.error, OSError):
+                    pass
+            sys.stdout.write("\033[?25h")
+            sys.stdout.flush()
+        return False
 
 
 class ConnectionProgress:
+    """Spinner with a step counter, or a live status line once connected."""
+
     FRAMES = ("◐", "◓", "◑", "◒")
 
     def __init__(self):
-        self.animated = sys.stdout.isatty() and not DEBUG
+        self.animated = interactive()
         self.message = ""
+        self.step = ""
+        self.render = None
         self.stopped = threading.Event()
         self.thread = None
         self.printed = False
 
-    def start(self, message):
-        self.message = message
+    def start(self, message, step=""):
+        self.message, self.step, self.render = message, step, None
         if not self.animated:
             if not DEBUG and not self.printed:
-                print("Connecting...", flush=True)
+                print("Connecting", flush=True)
                 self.printed = True
             return
-        self.stopped.clear()
-        self.thread = threading.Thread(target=self._animate, daemon=True)
-        self.thread.start()
+        self._run(0.12)
 
-    def update(self, message):
-        self.message = message
+    def live(self, render):
+        """Redraw render() in place every half second until pause()."""
+        if not self.animated:
+            return
+        self.render = render
+        self._run(0.5)
+
+    def update(self, message, step=""):
+        self.message, self.step = message, step
 
     def pause(self):
         if not self.animated or self.thread is None:
@@ -84,16 +177,25 @@ class ConnectionProgress:
         sys.stdout.flush()
         self.thread = None
 
-    def _animate(self):
+    def _run(self, interval):
+        self.pause()
+        self.stopped.clear()
+        self.thread = threading.Thread(target=self._animate, args=(interval,), daemon=True)
+        self.thread.start()
+
+    def _animate(self, interval):
         index = 0
         while not self.stopped.is_set():
-            marker = self.FRAMES[index % len(self.FRAMES)]
-            if not os.environ.get("NO_COLOR"):
-                marker = f"\033[36m{marker}\033[0m"
-            sys.stdout.write(f"\r\033[2K{marker} {self.message}")
+            if self.render:
+                line = self.render()
+            else:
+                marker = paint("36", self.FRAMES[index % len(self.FRAMES)])
+                step = f"  {dim(self.step)}" if self.step else ""
+                line = f"  {marker} {self.message}{step}"
+            sys.stdout.write(f"\r\033[2K{line}")
             sys.stdout.flush()
             index += 1
-            self.stopped.wait(0.12)
+            self.stopped.wait(interval)
 
 
 def run(args, timeout=30, check=True):
@@ -278,9 +380,26 @@ def dns_values(output):
     return ["Empty"] if output.startswith("There aren't any") else output.splitlines()
 
 
+def touch_id_sudo():
+    for name in ("/etc/pam.d/sudo", "/etc/pam.d/sudo_local"):
+        try:
+            if re.search(r"^\s*auth\s+\S+\s+pam_tid\.so", pathlib.Path(name).read_text(), re.MULTILINE):
+                return True
+        except OSError:
+            pass
+    return False
+
+
 def sudo_ready(prompt):
-    args = ["sudo", "-v"] if prompt else ["sudo", "-n", "-v"]
-    run(args, timeout=120 if prompt else 10)
+    if not prompt:
+        run(["sudo", "-n", "-v"], timeout=10)
+        return
+    if run(["sudo", "-n", "-v"], check=False, timeout=10).returncode == 0:
+        return
+    run(["sudo", "-v", "-p", "  Administrator password: "], timeout=120)
+    if interactive() and not touch_id_sudo():
+        sys.stdout.write("\033[1A\r\033[2K")
+        sys.stdout.flush()
 
 
 def profile_active(profile):
@@ -441,7 +560,7 @@ def recover(state, prompt=True):
 
 
 def stop_signal(number, _frame):
-    if number == signal.SIGINT:
+    if number == signal.SIGINT and not interactive():
         print(flush=True)
     raise KeyboardInterrupt()
 
@@ -458,8 +577,9 @@ def connect(config):
     if platform.system() != "Darwin":
         raise EncapError("This client currently supports macOS only")
     guard = lock(nonblocking=True)
+    terminal = TerminalGuard().__enter__()
     progress = ConnectionProgress()
-    progress.start("1/4  Checking network")
+    progress.start("Checking network", "1/4")
     try:
         log("info", "Checking network")
         if load_state():
@@ -467,7 +587,7 @@ def connect(config):
         if profile_active(config["profile"]):
             raise EncapError("WireGuard profile is already active")
         if any(prefix_owner(prefix) for prefix, _alias in PREFIXES):
-            raise EncapError("Another full-route VPN is active")
+            raise EncapError("Another full-route tunnel is active")
         default = route("default")
         gateway = field(default, "gateway")
         network_interface = field(default, "interface")
@@ -498,10 +618,10 @@ def connect(config):
         ipify_ip = socket.getaddrinfo("api.ipify.org", 443, socket.AF_INET, socket.SOCK_STREAM)[0][4][0]
         log("info", "Authorizing network changes")
         progress.pause()
-        if not DEBUG:
-            print("Authorizing network changes...", flush=True)
+        if not DEBUG and not progress.animated:
+            print("Authorizing network changes", flush=True)
         sudo_ready(True)
-        progress.start("2/4  Connecting to server")
+        progress.start("Connecting to server", "2/4")
         state = {
             "schema": 2,
             "owner_pid": os.getpid(),
@@ -525,6 +645,7 @@ def connect(config):
         for sig in (signal.SIGINT, signal.SIGTERM, signal.SIGHUP):
             signal.signal(sig, stop_signal)
         relay = None
+        opened = None
         relay_messages = deque(maxlen=30)
         failure = None
         try:
@@ -572,13 +693,13 @@ def connect(config):
             if relay.poll() is not None:
                 raise EncapError("WebSocket relay exited; check server HTTPS/443")
             log("info", "Starting WireGuard")
-            progress.update("3/4  Starting VPN")
+            progress.update("Starting tunnel", "3/4")
             up = run(["sudo", "-n", config["wg_quick"], "up", config["profile"]], timeout=50)
             match = re.search(r"Interface for [^\s]+ is (utun\d+)", up.stderr)
             if not match:
                 raise EncapError("WireGuard interface not found")
             interface = match.group(1)
-            log("debug", f"VPN interface: {interface}")
+            log("debug", f"Tunnel interface: {interface}")
             state["tunnel_interface"] = interface
             save_state(state)
             log("info", "Adding IPv4 routes")
@@ -588,7 +709,7 @@ def connect(config):
             if field(route(config["server_ip"]), "interface") != network_interface:
                 raise EncapError("Server route changed")
             log("info", "Checking exit IP and HTTPS")
-            progress.update("4/4  Verifying connection")
+            progress.update("Verifying connection", "4/4")
             check_https("https://api.ipify.org/", pinned=ipify_ip)
             if config.get("expected_exit_ip"):
                 result = run(
@@ -602,8 +723,12 @@ def connect(config):
             run(["sudo", "-n", "/usr/sbin/networksetup", "-setdnsservers", service] + config["dns_servers"])
             check_https(config["health_url"])
             progress.pause()
-            log("ok", f"Connected: {config['server_ip']}")
-            print("Keep this Terminal window open. Press Ctrl+C to disconnect.", flush=True)
+            opened = time.time()
+            if progress.animated:
+                progress.live(lambda: tunnel_line(True, config["server_ip"], opened, live=True))
+            else:
+                log("ok", f"Tunnel open: {config['server_ip']}")
+                print("Keep this window open. Press Ctrl+C to close the tunnel.", flush=True)
             last_refresh = time.monotonic()
             while True:
                 time.sleep(5)
@@ -617,18 +742,18 @@ def connect(config):
                 if field(route(config["server_ip"]), "interface") != network_interface:
                     raise EncapError("Server route changed")
                 if not all(prefix_on_interface(prefix, interface) for prefix, _alias in PREFIXES):
-                    raise EncapError("VPN route changed")
+                    raise EncapError("Tunnel route changed")
                 if time.monotonic() - last_refresh >= 60:
                     sudo_ready(False)
                     log("debug", "sudo refreshed")
                     last_refresh = time.monotonic()
         except KeyboardInterrupt:
             progress.pause()
-            log("info", "Stopping VPN")
+            log("info", "Closing tunnel")
         except BaseException as error:
             progress.pause()
             failure = error
-            log("warn", f"Connection stopped: {error}")
+            log("debug", f"Connection stopped: {error}")
             relay_errors = [line for line in relay_messages if any(word in line.lower() for word in ("error", "fail", "timeout", "denied"))]
             if relay_errors:
                 log("warn", f"wstunnel: {relay_errors[-1]}")
@@ -636,15 +761,20 @@ def connect(config):
             for sig in (signal.SIGINT, signal.SIGTERM, signal.SIGHUP):
                 signal.signal(sig, signal.SIG_IGN)
             log("info", "Restoring network")
+            progress.start("Closing tunnel")
             try:
                 recover(state, prompt=True)
-                log("ok", "VPN disconnected")
             except BaseException as error:
+                progress.pause()
                 raise EncapError(f"Restore incomplete: {error}. Run: encap stop") from error
+            progress.pause()
+            if opened:
+                print(tunnel_line(False, None, opened), flush=True)
         if failure:
             raise EncapError(str(failure))
     finally:
         progress.pause()
+        terminal.__exit__(None, None, None)
         os.close(guard)
 
 
@@ -654,9 +784,9 @@ def status():
         external = {prefix: owner for prefix, _alias in PREFIXES if (owner := prefix_owner(prefix))}
         if external:
             routes = ", ".join(f"{prefix} → {owner}" for prefix, owner in external.items())
-            log("warn", f"Another VPN route is active: {routes}")
+            log("warn", f"Another tunnel owns the routes: {routes}")
         else:
-            log("ok", "VPN off")
+            print(f"  {dim('○')} Tunnel closed", flush=True)
         return
     interface = state.get("tunnel_interface")
     active = (
@@ -665,39 +795,47 @@ def status():
         and all(prefix_on_interface(prefix, interface) for prefix, _alias in PREFIXES)
     )
     if active:
-        elapsed = max(0, int(time.time() - state["started_at"]))
-        log("ok", f"VPN on: {state['server_ip']} ({elapsed // 60} min)")
+        print(tunnel_line(True, state["server_ip"], state["started_at"]), flush=True)
     else:
-        log("warn", "Session ended. Run: encap")
+        log("warn", "Session ended unexpectedly")
+        hint("run encap to clean up")
 
 
 def disconnect():
     state = load_state()
     if not state:
-        log("ok", "VPN already disconnected")
+        print(f"  {dim('○')} Tunnel already closed", flush=True)
         return
+    progress = ConnectionProgress()
     pid = state.get("owner_pid")
     if process_alive(pid):
         command = run(["ps", "-p", str(pid), "-o", "command="], check=False).stdout
         if "encap.py" in command or "/encap" in command:
-            log("info", "Stopping VPN")
+            log("info", "Closing tunnel")
+            progress.start("Closing tunnel")
             os.kill(pid, signal.SIGTERM)
             for _ in range(300):
                 if not STATE_FILE.exists():
-                    log("ok", "VPN disconnected")
+                    progress.pause()
+                    print(tunnel_line(False, None, state["started_at"]), flush=True)
                     return
                 if not process_alive(pid):
                     break
                 time.sleep(0.1)
+            progress.pause()
             if process_alive(pid):
-                raise EncapError("VPN is still stopping. Run: encap stop")
+                raise EncapError("Tunnel is still closing. Run: encap stop")
     guard = lock(nonblocking=True)
     try:
         current = load_state()
         if current:
             log("info", "Restoring network")
-            recover(current, prompt=True)
-        log("ok", "VPN disconnected")
+            progress.start("Restoring network")
+            try:
+                recover(current, prompt=True)
+            finally:
+                progress.pause()
+        print(f"  {dim('○')} Tunnel closed", flush=True)
     finally:
         os.close(guard)
 
@@ -717,9 +855,10 @@ def doctor(config):
         log("warn", "No active network")
     log("ok", f"Server: {config['tls_host']} ({config['server_ip']})")
     if any(prefix_owner(prefix) for prefix, _alias in PREFIXES):
-        log("warn", "Another VPN route is active")
+        log("warn", "Another tunnel owns the routes")
     if load_state():
-        log("warn", "Session needs cleanup. Run: encap")
+        log("warn", "Session needs cleanup")
+        hint("run encap stop")
 
 
 def enrollment_request(server, path, payload=None, extra_headers=None, timeout=12):
@@ -832,6 +971,7 @@ def enroll_public(server, path):
         raise EncapError("Use a direct HTTPS server address")
     server = f"https://{parsed.hostname}"
     guard = lock(nonblocking=True)
+    progress = ConnectionProgress()
     try:
         if target.exists():
             raise EncapError("Already enrolled")
@@ -849,7 +989,7 @@ def enroll_public(server, path):
         public_key = validated_key(public_result.stdout.strip())
         host = parsed.hostname
         server_ip = socket.getaddrinfo(host, 443, socket.AF_INET, socket.SOCK_STREAM)[0][4][0]
-        print("Setting up private access...", flush=True)
+        progress.start("Registering this Mac")
         challenge = enrollment_request(server, "/v1/challenge")
         counter = solve_challenge(challenge.get("challenge"), public_key, challenge.get("difficulty"))
         response = enrollment_request(server, "/v1/enroll", {
@@ -907,8 +1047,10 @@ def enroll_public(server, path):
             token_file.unlink(missing_ok=True)
             target.unlink(missing_ok=True)
             raise
-        log("ok", "Private access ready")
+        progress.pause()
+        log("ok", "Registered this Mac")
     finally:
+        progress.pause()
         os.close(guard)
 
 
@@ -916,8 +1058,8 @@ def main():
     global DEBUG
     parser = argparse.ArgumentParser(
         prog="encap",
-        description="Private connection for macOS",
-        epilog="Run encap to connect or disconnect. Use encap status to check.",
+        description="Private tunnel over HTTPS for macOS",
+        epilog="Run encap to open or close the tunnel. Use encap status to check.",
     )
     parser.add_argument("--config", help="Config file path")
     parser.add_argument("--server", help="HTTPS server for first setup")
@@ -934,6 +1076,7 @@ def main():
             if load_state():
                 disconnect()
             else:
+                banner()
                 path = config_path(args.config)
                 if not path.is_file():
                     enroll_public(args.server or PUBLIC_SERVER, path)
@@ -946,6 +1089,8 @@ def main():
             disconnect()
         else:
             path = config_path(args.config)
+            if args.command == "connect":
+                banner()
             if args.command == "connect" and not path.is_file():
                 enroll_public(args.server or PUBLIC_SERVER, path)
             config = load_config(path)
@@ -954,12 +1099,15 @@ def main():
             else:
                 resume_public(config)
                 connect(config)
+    except KeyboardInterrupt:
+        print(flush=True)
+        return 130
     except (EncapError, KeyError, ValueError, OSError, plistlib.InvalidFileException) as error:
         log("error", str(error))
         if DEBUG:
             traceback.print_exc()
         else:
-            log("error", "Run encap --debug for details")
+            hint("run encap --debug for details")
         return 1
     return 0
 

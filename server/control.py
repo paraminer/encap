@@ -276,30 +276,30 @@ class Controller:
         if active_count >= MAX_PEERS:
             raise ControlError(503, "Server full")
         used = {row[0] for row in self.db.execute("SELECT address FROM peers WHERE revoked=0")}
-        address_vpn = next((str(NETWORK.network_address + i) for i in range(FIRST_PEER, 255)
+        address_tunnel = next((str(NETWORK.network_address + i) for i in range(FIRST_PEER, 255)
                             if str(NETWORK.network_address + i) not in used), None)
-        if address_vpn is None:
+        if address_tunnel is None:
             raise ControlError(503, "Server full")
         server_key = self.backend.public_key()
         token = secrets.token_urlsafe(32)
         token_hash = hashlib.sha256(token.encode()).hexdigest()
         try:
-            self.backend.add(public_key, address_vpn)
+            self.backend.add(public_key, address_tunnel)
             self.db.execute(
                 "INSERT INTO peers(public_key,address,token_hash,ip_hash,created,month,last_seen) VALUES(?,?,?,?,?,?,?)",
-                (public_key, address_vpn, token_hash, ip_hash, now, current_month(), now),
+                (public_key, address_tunnel, token_hash, ip_hash, now, current_month(), now),
             )
             self.db.execute("INSERT INTO enroll_events(ip_hash,created) VALUES(?,?)", (ip_hash, now))
             self.db.commit()
         except Exception:
             self.db.rollback()
             try:
-                self.backend.remove(public_key, address_vpn)
+                self.backend.remove(public_key, address_tunnel)
             except ControlError:
                 pass
             raise
         return {
-            "client_ip": address_vpn,
+            "client_ip": address_tunnel,
             "server_public_key": server_key,
             "access_token": token,
             "monthly_bytes": MONTHLY_BYTES,

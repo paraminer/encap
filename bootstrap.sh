@@ -58,7 +58,7 @@ else
 import hashlib
 import pathlib
 import sys
-expected = "e74d67c8815e4f30cf4610974b56e1cff558864933744dd7a407ad0f41a6fcd4"
+expected = "066b4913155c7221c0f7b2e24b57452252dd8ab6babc1af82164f88d88c87a21"
 actual = hashlib.sha256(pathlib.Path(sys.argv[1]).read_bytes()).hexdigest()
 if actual != expected:
     raise SystemExit("Encap source checksum mismatch")
@@ -120,10 +120,8 @@ for encap_profile in "$HOME/.zprofile" "$HOME/.zshrc"; do
     fi
 done
 
-if [ "${ENCAP_INSTALL_ONLY:-0}" != 1 ]; then
-    printf 'Installed. Connecting now. Later, run encap in a new Terminal window.\n'
-    rm -rf -- "$encap_temp"
-    trap - EXIT HUP INT TERM
-    PATH="$encap_bin:$PATH" exec "$encap_bin/encap"
+if [ -t 1 ] && [ -z "${NO_COLOR:-}" ]; then
+    printf '\n  \033[32m✓\033[0m Encap installed\n    \033[2mopen a new Terminal window and run encap\033[0m\n\n'
+else
+    printf 'Encap installed. Open a new Terminal window and run encap.\n'
 fi
-printf 'Installed. Run encap in a new Terminal window.\n'
