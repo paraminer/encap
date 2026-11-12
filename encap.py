@@ -271,8 +271,38 @@ def config_path(argument):
     return pathlib.Path(value).expanduser().resolve()
 
 
+def repair_profile_name(config_file, data):
+    value = data.get("wireguard_profile")
+    if not isinstance(value, str):
+        return
+    old = pathlib.Path(value).expanduser().resolve()
+    match = re.fullmatch(r"peer-([0-9a-f]{12})\.conf", old.name)
+    if not match:
+        return
+    new = old.with_name(f"e-{match.group(1)}.conf")
+    if old.is_file():
+        private_file(old)
+        if new.exists():
+            if new.is_symlink() or not os.path.samefile(old, new):
+                raise EncapError("Profile name collision")
+        else:
+            os.link(old, new)
+    else:
+        private_file(new)
+    data["wireguard_profile"] = str(new)
+    temporary = config_file.with_name(config_file.name + ".new-" + secrets.token_hex(4))
+    try:
+        write_private(temporary, json.dumps(data, indent=2) + "\n")
+        os.replace(temporary, config_file)
+    finally:
+        temporary.unlink(missing_ok=True)
+    old.unlink(missing_ok=True)
+    log("ok", "Profile name repaired")
+
+
 def load_config(path):
-    data = json.loads(private_file(path).read_text())
+    path = private_file(path)
+    data = json.loads(path.read_text())
     if not isinstance(data, dict):
         raise EncapError("Config must be a JSON object")
     required = ("server_ip", "tls_host", "relay_target", "wireguard_profile")
@@ -306,7 +336,11 @@ def load_config(path):
     data["health_url"] = data.get("health_url", "https://example.org/")
     if urlparse(data["health_url"]).scheme != "https" or not urlparse(data["health_url"]).hostname:
         raise EncapError("health_url must use HTTPS")
-    data["profile"] = str(private_file(data["wireguard_profile"]))
+    repair_profile_name(path, data)
+    profile_path = private_file(data["wireguard_profile"])
+    if not re.fullmatch(r"[A-Za-z0-9_=+.-]{1,15}", profile_path.stem):
+        raise EncapError("Invalid WireGuard profile name (max 15 characters)")
+    data["profile"] = str(profile_path)
     if bool(data.get("relay_secret_file")) == bool(data.get("access_token_file")):
         raise EncapError("Set one access credential file")
     data["wstunnel"] = resolve_binary(data.get("wstunnel", "wstunnel"))
@@ -541,8 +575,9 @@ def recover(state, prompt=True):
         and "STATIC" in server_route
     )
     if owns_server_route:
-        result = attempt(["sudo", "-n", "route", "-n", "delete", "-host", state["server_ip"]], "Server route")
-        if result is not None and result.returncode and "STATIC" in route(state["server_ip"]):
+        attempt(["sudo", "-n", "route", "-n", "delete", "-host", state["server_ip"]], "Server route")
+        remaining = route(state["server_ip"])
+        if field(remaining, "destination") == state["server_ip"] and "STATIC" in remaining:
             errors.append("Server route remains")
     try:
         if dns(state["network_service"]) != state["original_dns_text"]:
@@ -600,14 +635,18 @@ def connect(config):
         log("info", f"Network: {network_name or service} ({network_interface})")
         log("debug", f"Service: {service}; gateway: {gateway}; server: {config['server_ip']}")
         server_route = route(config["server_ip"])
-        cloned = (
+        same_physical_route = (
             field(server_route, "destination") == config["server_ip"]
             and field(server_route, "gateway") == gateway
             and field(server_route, "interface") == network_interface
+        )
+        cloned = (
+            same_physical_route
             and "WASCLONED" in server_route
             and "STATIC" not in server_route
         )
-        if field(server_route, "destination") != "default" and not cloned:
+        redundant_route = same_physical_route and "STATIC" in server_route
+        if field(server_route, "destination") != "default" and not (cloned or redundant_route):
             raise EncapError("Server has a custom route")
         original_dns_text = dns(service)
         original_dns = dns_values(original_dns_text)
@@ -636,7 +675,7 @@ def connect(config):
             "dns_servers": config["dns_servers"],
             "profile": config["profile"],
             "wg_quick": config["wg_quick"],
-            "host_route_owned": True,
+            "host_route_owned": not redundant_route,
         }
         if config.get("access_header_file"):
             state["access_header_file"] = config["access_header_file"]
@@ -649,14 +688,25 @@ def connect(config):
         relay_messages = deque(maxlen=30)
         failure = None
         try:
-            log("info", "Adding server route")
-            added = run(["sudo", "-n", "route", "-n", "add", "-host", config["server_ip"], gateway], check=False)
-            if added.returncode and cloned:
-                log("debug", "Removing cached server route")
-                run(["sudo", "-n", "route", "-n", "delete", "-host", config["server_ip"]], check=False)
+            if redundant_route:
+                current = route(config["server_ip"])
+                if (
+                    field(current, "destination") != config["server_ip"]
+                    or field(current, "gateway") != gateway
+                    or field(current, "interface") != network_interface
+                    or "STATIC" not in current
+                ):
+                    raise EncapError("Server route changed; retry connection")
+                log("debug", "Using existing server route")
+            else:
+                log("info", "Adding server route")
                 added = run(["sudo", "-n", "route", "-n", "add", "-host", config["server_ip"], gateway], check=False)
-            if added.returncode:
-                raise EncapError("Server route failed")
+                if added.returncode and cloned:
+                    log("debug", "Removing cached server route")
+                    run(["sudo", "-n", "route", "-n", "delete", "-host", config["server_ip"]], check=False)
+                    added = run(["sudo", "-n", "route", "-n", "add", "-host", config["server_ip"], gateway], check=False)
+                if added.returncode:
+                    raise EncapError("Server route failed")
             environment = os.environ.copy()
             environment.pop("NO_COLOR", None)
             log("info", "Starting WebSocket relay")
@@ -1008,8 +1058,8 @@ def enroll_public(server, path):
         target.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
         os.chmod(target.parent, 0o700)
         suffix = hashlib.sha256(public_key.encode()).hexdigest()[:12]
-        profile = target.parent / f"peer-{suffix}.conf"
-        token_file = target.parent / f"peer-{suffix}.token"
+        profile = target.parent / f"e-{suffix}.conf"
+        token_file = target.parent / f"e-{suffix}.token"
         profile_text = (
             "[Interface]\n"
             f"PrivateKey = {private_key}\n"
