@@ -12,7 +12,7 @@ curl -fsSL https://raw.githubusercontent.com/paraminer/encap/main/bootstrap.sh |
 
 The bootstrap script downloads and checks `encap.py`, adds Homebrew if needed, installs Python and WireGuard tools, verifies wstunnel, installs `encap`, and starts the connection. Homebrew and the VPN may ask for the Mac administrator password. Keep Terminal open while connected; press Ctrl+C to disconnect. In a new Terminal window, run `encap` to connect or disconnect again. `encap status`, `encap stop`, and `encap doctor` are also available. To install from a local checkout without connecting, run `ENCAP_INSTALL_ONLY=1 sh bootstrap.sh`.
 
-To use your own server, run `encap --server https://YOUR_PUBLIC_IP` on first launch. Use `--config PATH` for a separate registration. Private keys and tokens stay in `~/.config/encap` with file mode `0600`.
+To use your own server, install without connecting (`curl -fsSL https://raw.githubusercontent.com/paraminer/encap/main/bootstrap.sh | ENCAP_INSTALL_ONLY=1 sh`), then run `encap --server https://YOUR_PUBLIC_IP` in a new Terminal window. Use `--config PATH` for a separate registration. Private keys and tokens stay in `~/.config/encap` with file mode `0600`.
 
 The free server allows 40 active guest devices. A normal disconnect frees a slot immediately; after an abrupt loss, the server releases it about ten minutes after the last WireGuard handshake. The registration remains valid for a later connection. Each device has a 10 GB monthly limit; the server has a 500 GB monthly guest traffic limit. IPv4 is routed through the VPN. IPv6 traffic stays on the current network.
 
