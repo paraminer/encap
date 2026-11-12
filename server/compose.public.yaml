@@ -1,0 +1,123 @@
+x-encap-logging: &encap-logging
+  driver: json-file
+  options:
+    max-size: "10m"
+    max-file: "2"
+
+services:
+  wireguard:
+    image: lscr.io/linuxserver/wireguard@sha256:236f9a9a89c701bc83f6d41007157dc77361114d14e56a08e846bb4499622e97
+    restart: unless-stopped
+    cap_add:
+      - NET_ADMIN
+    security_opt:
+      - no-new-privileges:true
+    mem_limit: 256m
+    pids_limit: 128
+    logging: *encap-logging
+    environment:
+      PUID: "0"
+      PGID: "0"
+      TZ: ${TZ:-Etc/UTC}
+      SERVERURL: ${PUBLIC_HOST}
+      SERVERPORT: "51820"
+      PEERS: ${OWNER_PEER:-owner}
+      PEERDNS: ${PEER_DNS:-1.1.1.1}
+      INTERNAL_SUBNET: 10.77.77.0
+      ALLOWEDIPS: 0.0.0.0/0
+      LOG_CONFS: "false"
+    volumes:
+      - ./wg-config:/config
+    networks:
+      - private
+
+  relay:
+    image: ghcr.io/erebe/wstunnel@sha256:e2b62fac898406c73342e8e50fc21f7e221c17811aad532ed3a80a2e3c327b79
+    restart: unless-stopped
+    depends_on:
+      - wireguard
+    read_only: true
+    user: "1000:1000"
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    mem_limit: 256m
+    pids_limit: 64
+    logging: *encap-logging
+    entrypoint:
+      - /home/app/wstunnel
+    command:
+      - server
+      - --restrict-to
+      - wireguard:51820
+      - ws://0.0.0.0:8080
+    networks:
+      - private
+
+  control:
+    build:
+      context: .
+      dockerfile: Dockerfile.control
+    restart: unless-stopped
+    depends_on:
+      - wireguard
+    network_mode: service:wireguard
+    cap_drop:
+      - ALL
+    cap_add:
+      - NET_ADMIN
+    security_opt:
+      - no-new-privileges:true
+    read_only: true
+    mem_limit: 128m
+    pids_limit: 64
+    logging: *encap-logging
+    environment:
+      ENCAP_MAX_PEERS: ${ENCAP_MAX_PEERS:-40}
+      ENCAP_MONTHLY_BYTES: ${ENCAP_MONTHLY_BYTES:-10000000000}
+      ENCAP_GLOBAL_MONTHLY_BYTES: ${ENCAP_GLOBAL_MONTHLY_BYTES:-500000000000}
+      ENCAP_PER_IP_DAILY: ${ENCAP_PER_IP_DAILY:-3}
+      ENCAP_PER_IP_MONTHLY: ${ENCAP_PER_IP_MONTHLY:-10}
+      ENCAP_IDLE_MINUTES: ${ENCAP_IDLE_MINUTES:-10}
+    volumes:
+      - ./data:/data
+      - ./run:/run/encap
+
+  https:
+    image: caddy:2.11.9-alpine
+    restart: unless-stopped
+    depends_on:
+      - relay
+      - control
+    mem_limit: 256m
+    pids_limit: 128
+    logging: *encap-logging
+    read_only: true
+    cap_drop:
+      - ALL
+    cap_add:
+      - NET_BIND_SERVICE
+    security_opt:
+      - no-new-privileges:true
+    tmpfs:
+      - /tmp
+    environment:
+      PUBLIC_HOST: ${PUBLIC_HOST}
+      WG_PATH_SECRET: ${WG_PATH_SECRET:-}
+    ports:
+      - 80:80
+      - 443:443
+    volumes:
+      - ./Caddyfile.public:/etc/caddy/Caddyfile:ro
+      - ./caddy-data:/data
+      - ./caddy-config:/config
+      - ./acme:/var/www/acme:ro
+      - ./run:/run/encap:ro
+      - /etc/letsencrypt:/etc/letsencrypt:ro
+    networks:
+      - private
+
+networks:
+  private:
+    driver: bridge

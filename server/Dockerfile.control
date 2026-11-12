@@ -1,0 +1,5 @@
+FROM python:3.14.6-alpine
+RUN apk add --no-cache wireguard-tools iptables iproute2
+COPY control.py /app/control.py
+ENTRYPOINT ["python3", "/app/control.py"]
+CMD ["serve"]

@@ -1,0 +1,64 @@
+{
+	default_sni {$PUBLIC_HOST}
+}
+
+http://{$PUBLIC_HOST} {
+	root * /var/www/acme
+	handle /.well-known/acme-challenge/* {
+		file_server
+	}
+	handle {
+		respond "Not found" 404
+	}
+}
+
+https://{$PUBLIC_HOST} {
+	tls /etc/letsencrypt/live/{$PUBLIC_HOST}/fullchain.pem /etc/letsencrypt/live/{$PUBLIC_HOST}/privkey.pem
+
+	handle /v1/challenge {
+		reverse_proxy unix//run/encap/control.sock {
+			header_up Host encap-control
+			header_up X-Client-IP {remote_host}
+		}
+	}
+
+	handle /v1/enroll {
+		request_body {
+			max_size 512B
+		}
+		reverse_proxy unix//run/encap/control.sock {
+			header_up Host encap-control
+			header_up X-Client-IP {remote_host}
+		}
+	}
+
+	handle /v1/resume {
+		reverse_proxy unix//run/encap/control.sock {
+			header_up Host encap-control
+		}
+	}
+
+	handle /v1/release {
+		reverse_proxy unix//run/encap/control.sock {
+			header_up Host encap-control
+		}
+	}
+
+	handle /ws/* {
+		forward_auth unix//run/encap/control.sock {
+			uri /v1/auth
+			header_up Host encap-control
+			header_up X-Client-IP {remote_host}
+		}
+		reverse_proxy relay:8080 {
+			header_up -Authorization
+			transport http {
+				max_conns_per_host 64
+			}
+		}
+	}
+
+	handle {
+		respond "Not found" 404
+	}
+}
