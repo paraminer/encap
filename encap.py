@@ -436,6 +436,55 @@ def sudo_ready(prompt):
         sys.stdout.flush()
 
 
+def server_route_status(server_ip):
+    default = route("default")
+    gateway = field(default, "gateway")
+    interface = field(default, "interface")
+    if not gateway or not interface or interface.startswith("utun"):
+        return "offline"
+    current = route(server_ip)
+    destination = field(current, "destination")
+    if destination == "default":
+        return "ready"
+    if destination != server_ip:
+        return "custom"
+    old_gateway = field(current, "gateway")
+    if old_gateway == gateway and field(current, "interface") == interface:
+        return "ready"
+    if field(current, "interface") != interface or "STATIC" not in current:
+        return "custom"
+    try:
+        ipaddress.IPv4Address(old_gateway)
+    except ValueError:
+        return "custom"
+    gateway_route = route(old_gateway)
+    if (
+        field(gateway_route, "destination") == "default"
+        and field(gateway_route, "gateway") == gateway
+        and field(gateway_route, "interface") == interface
+    ):
+        return "stale"
+    return "custom"
+
+
+def prepare_server_route(server_ip):
+    status = server_route_status(server_ip)
+    if status == "ready":
+        return
+    if status == "offline":
+        raise EncapError("No physical default route")
+    if status != "stale":
+        raise EncapError("Server has a custom route")
+    old_gateway = field(route(server_ip), "gateway")
+    log("warn", "Removing stale server route")
+    sudo_ready(True)
+    if server_route_status(server_ip) != "stale" or field(route(server_ip), "gateway") != old_gateway:
+        raise EncapError("Server route changed; retry connection")
+    removed = run(["sudo", "-n", "route", "-n", "delete", "-host", server_ip], check=False)
+    if removed.returncode or server_route_status(server_ip) != "ready":
+        raise EncapError("Could not remove stale server route")
+
+
 def profile_active(profile):
     return pathlib.Path("/var/run/wireguard", pathlib.Path(profile).stem + ".name").exists()
 
@@ -904,6 +953,11 @@ def doctor(config):
     else:
         log("warn", "No active network")
     log("ok", f"Server: {config['tls_host']} ({config['server_ip']})")
+    server_status = server_route_status(config["server_ip"])
+    if server_status == "stale":
+        log("warn", "Stale server route; encap will remove it")
+    elif server_status == "custom":
+        log("warn", "Server has a custom route")
     if any(prefix_owner(prefix) for prefix, _alias in PREFIXES):
         log("warn", "Another tunnel owns the routes")
     if load_state():
@@ -1039,6 +1093,7 @@ def enroll_public(server, path):
         public_key = validated_key(public_result.stdout.strip())
         host = parsed.hostname
         server_ip = socket.getaddrinfo(host, 443, socket.AF_INET, socket.SOCK_STREAM)[0][4][0]
+        prepare_server_route(server_ip)
         progress.start("Registering this Mac")
         challenge = enrollment_request(server, "/v1/challenge")
         counter = solve_challenge(challenge.get("challenge"), public_key, challenge.get("difficulty"))
@@ -1131,6 +1186,7 @@ def main():
                 if not path.is_file():
                     enroll_public(args.server or PUBLIC_SERVER, path)
                 config = load_config(path)
+                prepare_server_route(config["server_ip"])
                 resume_public(config)
                 connect(config)
         elif args.command == "status":
@@ -1147,6 +1203,7 @@ def main():
             if args.command == "doctor":
                 doctor(config)
             else:
+                prepare_server_route(config["server_ip"])
                 resume_public(config)
                 connect(config)
     except KeyboardInterrupt:
