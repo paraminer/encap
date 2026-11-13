@@ -12,7 +12,7 @@ Press **Command + Space**, type **Terminal**, and press **Enter**. Then paste th
 curl -fsSL https://raw.githubusercontent.com/paraminer/encap/main/bootstrap.sh | sh
 ```
 
-**What does this do?** It downloads Encap's installer from GitHub. The installer fetches and verifies the client files, sets up any missing tools (including Homebrew, Python, WireGuard tools, and wstunnel), and adds the `encap` command to your Mac. macOS may ask for your administrator password to install software or configure networking.
+**What does this do?** It downloads Encap's installer from GitHub. The installer fetches and verifies the client files, sets up any missing tools (including Homebrew, Python, WireGuard tools, and wstunnel), and adds the `encap` command to your Mac. macOS may ask for your device password to install software. Installation does not connect the tunnel.
 
 Once installation finishes, run:
 
@@ -30,7 +30,7 @@ encap stop     # Disconnect
 encap doctor   # Check for common problems
 ```
 
-If your Mac says `command not found` right after installation, open a **new Terminal window** and try `encap` again.
+The installer checks that `encap` runs. You can use it in the same Terminal window. If your current `PATH` has no supported command directory, the installer prints the full command to use immediately; a new Terminal window will also pick up `encap`.
 
 ## The free public server
 

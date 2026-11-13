@@ -1,6 +1,8 @@
 #!/bin/sh
 set -eu
 
+encap_initial_path=$PATH
+
 if [ "$(uname -s)" != Darwin ]; then
     printf 'macOS is required.\n' >&2
     exit 1
@@ -101,16 +103,17 @@ install -d -m 700 "$encap_share" "$encap_share/bin" "$encap_bin"
 install -m 700 "$encap_temp/wstunnel" "$encap_share/bin/wstunnel"
 install -m 600 "$encap_temp/LICENSE" "$encap_share/LICENSE"
 install -m 700 "$encap_source" "$encap_share/encap.py"
-if [ -L "$encap_bin/encap" ]; then
-    rm -- "$encap_bin/encap"
+if [ -d "$encap_bin/encap" ]; then
+    printf 'Cannot replace a directory at %s.\n' "$encap_bin/encap" >&2
+    exit 1
 fi
-cat > "$encap_bin/encap" <<EOF
+cat > "$encap_temp/encap-launcher" <<EOF
 #!/bin/sh
 PATH="$encap_prefix/bin:$encap_prefix/sbin:\$HOME/.local/share/encap/bin:\$PATH"
 export PATH
 exec "$encap_python" "\$HOME/.local/share/encap/encap.py" "\$@"
 EOF
-chmod 700 "$encap_bin/encap"
+install -m 700 "$encap_temp/encap-launcher" "$encap_bin/encap"
 ln -sfn "$encap_share/bin/wstunnel" "$encap_bin/wstunnel"
 
 encap_path_line='export PATH="$HOME/.local/bin:$PATH"'
@@ -120,8 +123,77 @@ for encap_profile in "$HOME/.zprofile" "$HOME/.zshrc"; do
     fi
 done
 
+"$encap_bin/encap" status >/dev/null 2>&1 || {
+    printf 'Encap was installed but its launcher did not run.\n' >&2
+    exit 1
+}
+
+encap_found=$(PATH="$encap_initial_path" command -v encap || true)
+if [ "$encap_found" != "$encap_bin/encap" ]; then
+    encap_public_bin=
+    case "$encap_found" in
+        "$encap_prefix/bin/encap"|/usr/local/bin/encap)
+            encap_public_bin=${encap_found%/encap}
+            ;;
+        '')
+            case ":$encap_initial_path:" in
+                *":$encap_prefix/bin:"*) encap_public_bin=$encap_prefix/bin ;;
+                *:/usr/local/bin:*) encap_public_bin=/usr/local/bin ;;
+            esac
+            ;;
+    esac
+    if [ -n "$encap_found" ] && [ -z "$encap_public_bin" ]; then
+        printf 'Another encap command is first in PATH: %s\n' "$encap_found" >&2
+        printf 'Run %s/encap or remove the older command.\n' "$encap_bin" >&2
+        exit 1
+    fi
+    if [ -n "$encap_public_bin" ]; then
+        encap_public=$encap_public_bin/encap
+        if [ -e "$encap_public" ] || [ -L "$encap_public" ]; then
+            if [ -L "$encap_public" ]; then
+                encap_link=$(readlink "$encap_public")
+                case "$encap_link" in
+                    *encap*|*'Application Support'*) ;;
+                    *) printf 'A different command already uses %s.\n' "$encap_public" >&2; exit 1 ;;
+                esac
+            elif ! grep -Eiq 'encap|Application Support' "$encap_public" 2>/dev/null; then
+                printf 'A different command already uses %s.\n' "$encap_public" >&2
+                exit 1
+            fi
+        fi
+        cat > "$encap_temp/encap-public" <<'EOF'
+#!/bin/sh
+exec "$HOME/.local/bin/encap" "$@"
+EOF
+        if [ ! -d "$encap_public_bin" ]; then
+            sudo -p 'Your device password: ' install -d -m 755 "$encap_public_bin"
+        fi
+        if [ -w "$encap_public_bin" ]; then
+            install -m 755 "$encap_temp/encap-public" "$encap_public"
+        else
+            sudo -p 'Your device password: ' install -m 755 "$encap_temp/encap-public" "$encap_public"
+        fi
+    fi
+fi
+
+encap_ready=$(PATH="$encap_initial_path" command -v encap || true)
+if [ -n "$encap_ready" ]; then
+    PATH="$encap_initial_path" "$encap_ready" status >/dev/null 2>&1 || {
+        printf 'The encap command in your PATH did not run: %s\n' "$encap_ready" >&2
+        exit 1
+    }
+fi
+
 if [ -t 1 ] && [ -z "${NO_COLOR:-}" ]; then
-    printf '\n  \033[32m✓\033[0m Encap installed\n    \033[2mopen a new Terminal window and run encap\033[0m\n\n'
+    if [ -n "$encap_ready" ]; then
+        printf '\n  \033[32m✓\033[0m Encap installed\n    \033[2mrun encap to connect\033[0m\n\n'
+    else
+        printf '\n  \033[32m✓\033[0m Encap installed\n    \033[2mrun %s/encap now, or open a new Terminal and run encap\033[0m\n\n' "$encap_bin"
+    fi
 else
-    printf 'Encap installed. Open a new Terminal window and run encap.\n'
+    if [ -n "$encap_ready" ]; then
+        printf 'Encap installed. Run encap to connect.\n'
+    else
+        printf 'Encap installed. Run %s/encap now, or open a new Terminal and run encap.\n' "$encap_bin"
+    fi
 fi
