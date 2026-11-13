@@ -28,7 +28,10 @@ Keep Terminal open while you're connected. Press **Ctrl+C** to disconnect. You c
 encap status   # Check your connection
 encap stop     # Disconnect
 encap doctor   # Check for common problems
+encap uninstall # Disconnect and remove Encap from this Mac
 ```
+
+`encap uninstall` deletes the local client, its keys, tokens, and configuration. It leaves Homebrew and shared tools installed. The public server may retain past usage and registration records.
 
 The installer checks that `encap` runs. You can use it in the same Terminal window. If your current `PATH` has no supported command directory, the installer prints the full command to use immediately; a new Terminal window will also pick up `encap`.
 

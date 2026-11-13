@@ -939,6 +939,67 @@ def disconnect():
         os.close(guard)
 
 
+def remove_encap_path(path):
+    if path.is_symlink() or path.is_file():
+        path.unlink()
+    elif path.is_dir():
+        shutil.rmtree(path)
+
+
+def uninstall(home=None, public_paths=None):
+    home = pathlib.Path(home) if home is not None else pathlib.Path.home()
+    if public_paths is None:
+        public_paths = (pathlib.Path("/usr/local/bin/encap"), pathlib.Path("/opt/homebrew/bin/encap"))
+    if load_state():
+        disconnect()
+    guard = lock(nonblocking=True)
+    try:
+        if load_state():
+            raise EncapError("Tunnel is still active. Run: encap stop")
+        config_dir = home / ".config" / "encap"
+        for profile in config_dir.glob("*.conf"):
+            if profile_active(profile):
+                raise EncapError("WireGuard is still active. Run: encap stop")
+        local_bin = home / ".local" / "bin"
+        if (local_bin / "encap").is_dir() and not (local_bin / "encap").is_symlink():
+            raise EncapError("Cannot remove a directory at ~/.local/bin/encap")
+        config_file = config_dir / "config.json"
+        if config_file.is_file() and not config_file.is_symlink():
+            try:
+                saved = json.loads(config_file.read_text())
+                release_public({"access_header_file": saved.get("access_token_file"), "tls_host": saved.get("tls_host")})
+            except (ValueError, OSError, AttributeError):
+                pass
+        for path in map(pathlib.Path, public_paths):
+            if path.is_symlink():
+                recognized = any(marker in os.readlink(path) for marker in ("encap", "Application Support"))
+            elif path.is_file():
+                with path.open("rb") as file:
+                    content = file.read(4096)
+                recognized = content.startswith(b"#!") and any(marker in content for marker in (
+                    b'.local/bin/encap', b'.local/share/encap', b'Application Support/encap',
+                ))
+            else:
+                recognized = False
+            if not recognized:
+                continue
+            if os.access(path.parent, os.W_OK):
+                path.unlink()
+            else:
+                sudo_ready(True)
+                run(["sudo", "-n", "rm", "-f", str(path)])
+        relay_link = local_bin / "wstunnel"
+        if relay_link.is_symlink() and os.readlink(relay_link) == str(home / ".local" / "share" / "encap" / "bin" / "wstunnel"):
+            relay_link.unlink()
+        remove_encap_path(local_bin / "encap")
+        remove_encap_path(home / ".local" / "share" / "encap")
+        remove_encap_path(config_dir)
+        remove_encap_path(home / ".local" / "state" / "encap")
+    finally:
+        os.close(guard)
+    log("ok", "Encap removed")
+
+
 def doctor(config):
     if platform.system() != "Darwin":
         raise EncapError("macOS only")
@@ -1169,10 +1230,15 @@ def main():
     parser.add_argument("--config", help="Config file path")
     parser.add_argument("--server", help="HTTPS server for first setup")
     parser.add_argument("--debug", action="store_true", help="Show details")
-    parser.add_argument("command", nargs="?", default="toggle", choices=("doctor", "connect", "status", "stop", "disconnect", "enroll"))
+    parser.add_argument("command", nargs="?", default="toggle", choices=("doctor", "connect", "status", "stop", "disconnect", "enroll", "uninstall"))
     args = parser.parse_args()
     DEBUG = args.debug
     try:
+        if args.command == "uninstall":
+            if args.config or args.server:
+                raise EncapError("Uninstall does not accept --config or --server")
+            uninstall()
+            return 0
         if args.server and args.command != "enroll" and config_path(args.config).is_file():
             raise EncapError("Already enrolled. Use encap --config PATH --server URL to add another server")
         if args.command == "enroll":
