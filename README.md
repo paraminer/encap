@@ -9,7 +9,7 @@ Encap connects a Mac to a WireGuard tunnel through HTTPS WebSocket. The client c
 Press **Command + Space**, type **Terminal**, and press **Enter**. Then paste this command and press Enter again:
 
 ```sh
-curl -fsSL https://raw.githubusercontent.com/paraminer/encap/main/bootstrap.sh | sh
+curl -fsSL https://raw.githubusercontent.com/paraminer/encap/main/bootstrap.sh | sh && export PATH="$HOME/.local/bin:$PATH" && hash -r
 ```
 
 **What does this do?** It downloads Encap's installer from GitHub. The installer fetches and verifies the client files, sets up any missing tools (including Homebrew, Python, WireGuard tools, and wstunnel), and adds the `encap` command to your Mac. macOS may ask for your device password to install software. Installation does not connect the tunnel.
@@ -33,7 +33,7 @@ encap uninstall # Disconnect and remove Encap from this Mac
 
 `encap uninstall` deletes the local client, its keys, tokens, and configuration. It leaves Homebrew and shared tools installed. The public server may retain past usage and registration records.
 
-The installer checks that `encap` runs. You can use it in the same Terminal window. If your current `PATH` has no supported command directory, the installer prints the full command to use immediately; a new Terminal window will also pick up `encap`.
+The command adds Encap to the current Terminal's `PATH`, so `encap` works without reopening Terminal. The installer also checks that its launcher runs.
 
 ## The free public server
 

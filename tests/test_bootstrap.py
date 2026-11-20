@@ -1,4 +1,5 @@
 import os
+import hashlib
 from pathlib import Path
 import shlex
 import shutil
@@ -32,9 +33,15 @@ class BootstrapTest(unittest.TestCase):
         self.repo.mkdir()
         shutil.copy2(ROOT / "bootstrap.sh", self.repo / "bootstrap.sh")
         shutil.copy2(ROOT / "encap.py", self.repo / "encap.py")
+        bootstrap = self.repo / "bootstrap.sh"
+        fake_binary = b"#!/bin/sh\nexit 0\n"
+        bootstrap.write_text(bootstrap.read_text().replace(
+            "3c814a9b16481b6b17b9ea02b679b8b21454788da6c61366c4d26fca823c9feb",
+            hashlib.sha256(fake_binary).hexdigest(),
+        ))
         executable(self.fake_bin / "uname", '#!/bin/sh\ncase "$1" in -s) echo Darwin ;; -m) echo arm64 ;; esac\n')
-        executable(self.fake_bin / "brew", '#!/bin/sh\nif [ "$1" = --prefix ]; then printf "%s\\n" "$ENCAP_TEST_PREFIX"; fi\n')
-        executable(self.fake_bin / "curl", '#!/bin/sh\nwhile [ "$#" -gt 0 ]; do if [ "$1" = -o ]; then shift; out=$1; fi; shift; done\nprintf archive > "$out"\n')
+        executable(self.fake_bin / "brew", '#!/bin/sh\nif [ "$1" = --prefix ]; then printf "%s\\n" "$ENCAP_TEST_PREFIX"; exit 0; fi\nif [ "$1" = install ]; then printf "%s\\n" "$*" >> "$ENCAP_TEST_BREW_LOG"; for tool in wg wg-quick wireguard-go; do printf "#!/bin/sh\\nexit 0\\n" > "$ENCAP_TEST_PREFIX/bin/$tool"; chmod +x "$ENCAP_TEST_PREFIX/bin/$tool"; done; fi\n')
+        executable(self.fake_bin / "curl", '#!/bin/sh\nprintf "%s\\n" "$*" >> "$ENCAP_TEST_CURL_LOG"\nwhile [ "$#" -gt 0 ]; do if [ "$1" = -o ]; then shift; out=$1; fi; shift; done\nprintf archive > "$out"\n')
         executable(self.fake_bin / "netstat", '#!/bin/sh\nexit 0\n')
         executable(self.fake_bin / "tar", '#!/bin/sh\nwhile [ "$#" -gt 0 ]; do if [ "$1" = -C ]; then shift; dest=$1; fi; shift; done\nprintf "#!/bin/sh\\nexit 0\\n" > "$dest/wstunnel"\nprintf license > "$dest/LICENSE"\n')
         executable(
@@ -46,6 +53,8 @@ class BootstrapTest(unittest.TestCase):
         env = os.environ.copy()
         env["HOME"] = str(self.home)
         env["ENCAP_TEST_PREFIX"] = str(self.prefix)
+        env["ENCAP_TEST_BREW_LOG"] = str(self.root / "brew.log")
+        env["ENCAP_TEST_CURL_LOG"] = str(self.root / "curl.log")
         env["PATH"] = ":".join([str(self.fake_bin), *map(str, paths), "/usr/bin", "/bin", "/usr/sbin", "/sbin"])
         return env
 
@@ -117,6 +126,45 @@ class BootstrapTest(unittest.TestCase):
         self.install(env)
         self.assertFalse(old.is_symlink())
         self.check_command(env, old)
+
+    def test_reinstall_reuses_verified_dependencies(self):
+        env = self.environment(self.local_bin)
+        self.install(env)
+        self.assertEqual((self.root / "brew.log").read_text().count("wireguard-tools"), 1)
+        self.assertEqual(len((self.root / "curl.log").read_text().splitlines()), 1)
+        self.install(env)
+        self.assertEqual((self.root / "brew.log").read_text().count("wireguard-tools"), 1)
+        self.assertEqual(len((self.root / "curl.log").read_text().splitlines()), 1)
+
+    def test_modified_cached_transport_is_redownloaded(self):
+        env = self.environment(self.local_bin)
+        self.install(env)
+        (self.home / ".local/share/encap/bin/wstunnel").write_text("modified")
+        self.install(env)
+        self.assertEqual(len((self.root / "curl.log").read_text().splitlines()), 2)
+
+    def test_existing_python_skips_brew_python(self):
+        (self.prefix_bin / "python3").unlink()
+        executable(self.fake_bin / "python3", f'#!/bin/sh\nif [ "$1" = - ]; then cat >/dev/null; exit 0; fi\nexec {shlex.quote(sys.executable)} "$@"\n')
+        env = self.environment(self.local_bin)
+        self.install(env)
+        self.assertNotIn("python@3.14", (self.root / "brew.log").read_text())
+        self.check_command(env, self.local_bin / "encap")
+
+    def test_install_command_updates_current_zsh_path(self):
+        env = self.environment()
+        command = (
+            f'/bin/sh {shlex.quote(str(self.repo / "bootstrap.sh"))}'
+            ' && export PATH="$HOME/.local/bin:$PATH" && hash -r'
+            ' && command -v encap && encap status'
+        )
+        result = subprocess.run(
+            ["/bin/zsh", "-c", command], env=env,
+            capture_output=True, text=True, timeout=30,
+        )
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn(str(self.local_bin / "encap"), result.stdout)
+        self.assertIn("Tunnel closed", result.stdout)
 
 
 if __name__ == "__main__":

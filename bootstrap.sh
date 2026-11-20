@@ -40,8 +40,12 @@ PATH="$encap_prefix/bin:$encap_prefix/sbin:$PATH"
 export PATH
 encap_python=$encap_prefix/bin/python3
 if [ ! -x "$encap_python" ] || ! "$encap_python" -c 'import sys; assert sys.version_info >= (3, 10)' >/dev/null 2>&1; then
-    "$encap_brew" install python@3.14
-    encap_python=$encap_prefix/bin/python3.14
+    encap_python=$(command -v python3 || true)
+    if [ -z "$encap_python" ] || ! "$encap_python" -c 'import sys; assert sys.version_info >= (3, 10)' >/dev/null 2>&1; then
+        printf 'Installing Python...\n'
+        HOMEBREW_NO_AUTO_UPDATE=1 "$encap_brew" install python@3.14
+        encap_python=$encap_prefix/bin/python3.14
+    fi
 fi
 
 "$encap_python" -c 'import sys; assert sys.version_info >= (3, 10)' || {
@@ -67,16 +71,27 @@ if actual != expected:
 PY
 fi
 
-"$encap_brew" install wireguard-tools
+if [ ! -x "$encap_prefix/bin/wg" ] || [ ! -x "$encap_prefix/bin/wg-quick" ] || [ ! -x "$encap_prefix/bin/wireguard-go" ]; then
+    printf 'Installing WireGuard tools...\n'
+    HOMEBREW_NO_AUTO_UPDATE=1 "$encap_brew" install wireguard-tools
+fi
+for encap_tool in wg wg-quick wireguard-go; do
+    if [ ! -x "$encap_prefix/bin/$encap_tool" ]; then
+        printf 'WireGuard tool missing after installation: %s\n' "$encap_tool" >&2
+        exit 1
+    fi
+done
 
 case "$(uname -m)" in
     arm64)
         encap_arch=arm64
         encap_hash=87fc0d68563248729c8c45359e5a7501041990145850c43c23a96e51656c2880
+        encap_binary_hash=3c814a9b16481b6b17b9ea02b679b8b21454788da6c61366c4d26fca823c9feb
         ;;
     x86_64)
         encap_arch=amd64
         encap_hash=68bf470b58f6cb7d3dcd96deb42fb5676b8810ef7751a53f7d9e3f8178a1d085
+        encap_binary_hash=72349e8eda9b80762e809b51dbe3c81aea8094b57da6ab6bb97274f048be4adb
         ;;
     *)
         printf 'Unsupported Mac architecture.\n' >&2
@@ -84,10 +99,17 @@ case "$(uname -m)" in
         ;;
 esac
 
-encap_archive=$encap_temp/wstunnel.tar.gz
-encap_url=https://github.com/erebe/wstunnel/releases/download/v11.1.0/wstunnel_11.1.0_darwin_${encap_arch}.tar.gz
-curl --proto '=https' --tlsv1.2 --location --fail --silent --show-error --retry 3 "$encap_url" -o "$encap_archive"
-"$encap_python" - "$encap_archive" "$encap_hash" <<'PY'
+encap_share=$HOME/.local/share/encap
+encap_bin=$HOME/.local/bin
+encap_cached_wstunnel=false
+if [ -x "$encap_share/bin/wstunnel" ] && [ -f "$encap_share/LICENSE" ] && "$encap_python" -c 'import hashlib, pathlib, sys; sys.exit(hashlib.sha256(pathlib.Path(sys.argv[1]).read_bytes()).hexdigest() != sys.argv[2])' "$encap_share/bin/wstunnel" "$encap_binary_hash"; then
+    encap_cached_wstunnel=true
+else
+    printf 'Downloading wstunnel...\n'
+    encap_archive=$encap_temp/wstunnel.tar.gz
+    encap_url=https://github.com/erebe/wstunnel/releases/download/v11.1.0/wstunnel_11.1.0_darwin_${encap_arch}.tar.gz
+    curl --proto '=https' --tlsv1.2 --location --fail --silent --show-error --retry 3 --connect-timeout 10 "$encap_url" -o "$encap_archive"
+    "$encap_python" - "$encap_archive" "$encap_hash" <<'PY'
 import hashlib
 import pathlib
 import sys
@@ -95,13 +117,14 @@ actual = hashlib.sha256(pathlib.Path(sys.argv[1]).read_bytes()).hexdigest()
 if actual != sys.argv[2]:
     raise SystemExit("wstunnel checksum mismatch")
 PY
-tar -xzf "$encap_archive" -C "$encap_temp" wstunnel LICENSE
+    tar -xzf "$encap_archive" -C "$encap_temp" wstunnel LICENSE
+fi
 
-encap_share=$HOME/.local/share/encap
-encap_bin=$HOME/.local/bin
 install -d -m 700 "$encap_share" "$encap_share/bin" "$encap_bin"
-install -m 700 "$encap_temp/wstunnel" "$encap_share/bin/wstunnel"
-install -m 600 "$encap_temp/LICENSE" "$encap_share/LICENSE"
+if [ "$encap_cached_wstunnel" = false ]; then
+    install -m 700 "$encap_temp/wstunnel" "$encap_share/bin/wstunnel"
+    install -m 600 "$encap_temp/LICENSE" "$encap_share/LICENSE"
+fi
 install -m 700 "$encap_source" "$encap_share/encap.py"
 if [ -d "$encap_bin/encap" ]; then
     printf 'Cannot replace a directory at %s.\n' "$encap_bin/encap" >&2
