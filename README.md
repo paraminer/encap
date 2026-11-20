@@ -12,7 +12,7 @@ Press **Command + Space**, type **Terminal**, and press **Enter**. Then paste th
 curl -fsSL https://raw.githubusercontent.com/paraminer/encap/main/bootstrap.sh | sh && export PATH="$HOME/.local/bin:$PATH" && hash -r
 ```
 
-**What does this do?** It downloads Encap's installer from GitHub. The installer fetches and verifies the client files, sets up any missing tools (including Homebrew, Python, WireGuard tools, and wstunnel), and adds the `encap` command to your Mac. macOS may ask for your device password to install software. Installation does not connect the tunnel.
+**What does this do?** It downloads Encap's installer from GitHub. The installer fetches a self-contained Python, WireGuard (`wireguard-go` and `wg`), and wstunnel, checks every file against a pinned SHA-256, and adds the `encap` command to your Mac. It needs macOS 14 or newer, takes about 10 seconds, and asks for no password. It does not use Homebrew and does not connect the tunnel.
 
 Once installation finishes, run:
 
@@ -22,7 +22,7 @@ encap
 
 On first launch, Encap generates your WireGuard keys on your Mac, registers your device with the server, and opens the tunnel.
 
-Keep Terminal open while you're connected. Press **Ctrl+C** to disconnect. You can also use:
+Keep Terminal open while you're connected. Press **Ctrl+C** to disconnect. If your Mac goes to sleep, Encap closes the tunnel first. You can also use:
 
 ```sh
 encap status   # Check your connection
@@ -31,9 +31,9 @@ encap doctor   # Check for common problems
 encap uninstall # Disconnect and remove Encap from this Mac
 ```
 
-`encap uninstall` deletes the local client, its keys, tokens, and configuration. It leaves Homebrew and shared tools installed. The public server may retain past usage and registration records.
+`encap uninstall` deletes everything Encap installed: the client and its tools in `~/.local/share/encap`, plus its keys, tokens, and configuration. The public server may retain past usage and registration records.
 
-The command adds Encap to the current Terminal's `PATH`, so `encap` works without reopening Terminal. The installer also checks that its launcher runs.
+The command adds Encap to the current Terminal's `PATH`, so `encap` works without reopening Terminal. Opening the tunnel asks for your Mac password, because changing routes needs administrator rights.
 
 ## The free public server
 
@@ -164,6 +164,8 @@ Use `--config PATH` if you want to keep a separate local configuration for your 
 ## Feedback and contributions
 
 I'm always open to suggestions and requests for changes. Please open an [issue](https://github.com/paraminer/encap/issues/new) or submit a [pull request](https://github.com/paraminer/encap/pulls).
+
+When you change `encap.py`, update `encap_source_sha` in `bootstrap.sh`. Run the tests with `python3 -m unittest discover -s tests`.
 
 ## License
 

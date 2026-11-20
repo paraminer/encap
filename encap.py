@@ -2,6 +2,7 @@
 
 import argparse
 import base64
+import ctypes
 from collections import deque
 import fcntl
 import hashlib
@@ -31,12 +32,18 @@ from urllib.parse import urlparse
 STATE_DIR = pathlib.Path.home() / ".local" / "state" / "encap"
 STATE_FILE = STATE_DIR / "session.plist"
 LOCK_FILE = STATE_DIR / "lock"
+BUNDLED_BIN = pathlib.Path(__file__).resolve().parent / "bin"
+WIREGUARD_RUN = pathlib.Path("/var/run/wireguard")
 PREFIXES = (("0.0.0.0/1", "0/1"), ("128.0.0.0/1", "128.0/1"))
 DEBUG = False
 PUBLIC_SERVER = "https://167.104.110.55"
 
 
 class EncapError(Exception):
+    pass
+
+
+class MacSleeping(Exception):
     pass
 
 
@@ -72,6 +79,8 @@ def banner():
         return
     lines = list(LOGO)
     lines[4] = f"{lines[4]:<29}{dim(TAGLINE)}"
+    # Start each session on a clean screen, like `clear`: screen and scrollback.
+    sys.stdout.write("\033[H\033[2J\033[3J")
     print("\n" + "\n".join("  " + line for line in lines) + "\n", flush=True)
 
 
@@ -94,12 +103,89 @@ def hint(message):
     print(f"    {dim(message, sys.stderr)}", file=sys.stderr, flush=True)
 
 
-def tunnel_line(opened, server_ip, started, live=False):
+def tunnel_line(opened, server_ip, started, live=False, note=None):
     """One status line: '● Tunnel open  1.2.3.4  02:14' or '○ Tunnel closed  02:14'."""
     if opened:
         text = f"  {paint('32', '●')} Tunnel open   {server_ip}   {clock(time.time() - started)}"
         return text + (f"   {dim('ctrl+c to close')}" if live else "")
-    return f"  {dim('○')} Tunnel closed   {dim(clock(time.time() - started))}"
+    return f"  {dim('○')} Tunnel closed   {dim(clock(time.time() - started))}" + (f"   {dim(note)}" if note else "")
+
+
+class SleepWatcher:
+    """Hears macOS say it is about to sleep (lid closed, Sleep menu, idle) and holds
+    the sleep until the tunnel is closed, so the Mac never sleeps with routes and DNS
+    pointing at a tunnel that is about to die. macOS waits up to 30 seconds."""
+
+    CAN_SLEEP = 0xE0000270
+    WILL_SLEEP = 0xE0000280
+    HOLD_SECONDS = 20
+
+    def __init__(self):
+        self.sleeping = threading.Event()
+        self.closed = threading.Event()
+        self.loop = None
+        self.root = 0
+
+    def start(self):
+        ready = threading.Event()
+        threading.Thread(target=self._run, args=(ready,), daemon=True).start()
+        ready.wait(2)
+        return self
+
+    def _run(self, ready):
+        try:
+            iokit = ctypes.CDLL("/System/Library/Frameworks/IOKit.framework/IOKit")
+            cf = ctypes.CDLL("/System/Library/Frameworks/CoreFoundation.framework/CoreFoundation")
+            callback_type = ctypes.CFUNCTYPE(None, ctypes.c_void_p, ctypes.c_uint32, ctypes.c_uint32, ctypes.c_void_p)
+            iokit.IORegisterForSystemPower.restype = ctypes.c_uint32
+            iokit.IORegisterForSystemPower.argtypes = [ctypes.c_void_p, ctypes.POINTER(ctypes.c_void_p), callback_type, ctypes.POINTER(ctypes.c_uint32)]
+            iokit.IOAllowPowerChange.argtypes = [ctypes.c_uint32, ctypes.c_long]
+            iokit.IONotificationPortGetRunLoopSource.restype = ctypes.c_void_p
+            iokit.IONotificationPortGetRunLoopSource.argtypes = [ctypes.c_void_p]
+            iokit.IODeregisterForSystemPower.argtypes = [ctypes.POINTER(ctypes.c_uint32)]
+            iokit.IOServiceClose.argtypes = [ctypes.c_uint32]
+            iokit.IONotificationPortDestroy.argtypes = [ctypes.c_void_p]
+            cf.CFRunLoopGetCurrent.restype = ctypes.c_void_p
+            cf.CFRunLoopAddSource.argtypes = [ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p]
+            cf.CFRunLoopStop.argtypes = [ctypes.c_void_p]
+
+            def on_power(_refcon, _service, message, argument):
+                if message == self.CAN_SLEEP:
+                    iokit.IOAllowPowerChange(self.root, argument or 0)
+                elif message == self.WILL_SLEEP:
+                    self.sleeping.set()
+                    self.closed.wait(self.HOLD_SECONDS)
+                    iokit.IOAllowPowerChange(self.root, argument or 0)
+
+            self._callback = callback_type(on_power)
+            port = ctypes.c_void_p()
+            notifier = ctypes.c_uint32()
+            self.root = iokit.IORegisterForSystemPower(None, ctypes.byref(port), self._callback, ctypes.byref(notifier))
+            if not self.root:
+                return
+            self.loop = cf.CFRunLoopGetCurrent()
+            mode = ctypes.c_void_p.in_dll(cf, "kCFRunLoopDefaultMode")
+            cf.CFRunLoopAddSource(self.loop, iokit.IONotificationPortGetRunLoopSource(port), mode)
+            self._stop = lambda: cf.CFRunLoopStop(self.loop)
+            ready.set()
+            cf.CFRunLoopRun()
+            iokit.IODeregisterForSystemPower(ctypes.byref(notifier))
+            iokit.IOServiceClose(self.root)
+            iokit.IONotificationPortDestroy(port)
+        except (OSError, AttributeError, ValueError) as error:
+            log("debug", f"Sleep watch unavailable: {error}")
+        finally:
+            ready.set()
+
+    def release(self):
+        """The tunnel is closed; let the Mac sleep."""
+        self.closed.set()
+
+    def stop(self):
+        self.closed.set()
+        if self.loop:
+            self._stop()
+            self.loop = None
 
 
 class TerminalGuard:
@@ -198,10 +284,10 @@ class ConnectionProgress:
             self.stopped.wait(interval)
 
 
-def run(args, timeout=30, check=True):
+def run(args, timeout=30, check=True, input=None):
     started = time.monotonic()
     try:
-        result = subprocess.run(args, capture_output=True, text=True, timeout=timeout)
+        result = subprocess.run(args, capture_output=True, text=True, timeout=timeout, input=input)
     except (OSError, subprocess.TimeoutExpired) as error:
         raise EncapError(f"{args[0]}: {error}") from error
     log("debug", f"{pathlib.Path(args[0]).name}: exit {result.returncode}, {time.monotonic() - started:.2f}s")
@@ -259,6 +345,10 @@ def lock(nonblocking=False):
 
 
 def resolve_binary(value):
+    # The installer keeps pinned, checksum-verified tools next to encap.py.
+    bundled = BUNDLED_BIN / pathlib.Path(value).name
+    if bundled.is_file() and os.access(bundled, os.X_OK):
+        return str(bundled)
     path = pathlib.Path(value).expanduser()
     found = str(path) if path.is_absolute() else shutil.which(value)
     if not found or not os.access(found, os.X_OK):
@@ -344,7 +434,6 @@ def load_config(path):
     if bool(data.get("relay_secret_file")) == bool(data.get("access_token_file")):
         raise EncapError("Set one access credential file")
     data["wstunnel"] = resolve_binary(data.get("wstunnel", "wstunnel"))
-    data["wg_quick"] = resolve_binary(data.get("wg_quick", "wg-quick"))
     data["wg"] = resolve_binary(data.get("wg", "wg"))
     data["wireguard_go"] = resolve_binary(data.get("wireguard_go", "wireguard-go"))
     profile = pathlib.Path(data["profile"]).read_text()
@@ -486,7 +575,94 @@ def prepare_server_route(server_ip):
 
 
 def profile_active(profile):
-    return pathlib.Path("/var/run/wireguard", pathlib.Path(profile).stem + ".name").exists()
+    return (WIREGUARD_RUN / (pathlib.Path(profile).stem + ".name")).exists()
+
+
+def wireguard_settings(text):
+    """Split a wg-quick profile into a plain `wg addconf` config, addresses and MTU."""
+    section, addresses, mtu, lines = None, [], None, []
+    for line in text.splitlines():
+        stripped = line.split("#", 1)[0].strip()
+        if stripped.startswith("["):
+            section = stripped.lower()
+        key, separator, value = (part.strip() for part in stripped.partition("="))
+        if section == "[interface]" and separator:
+            if key == "Address":
+                addresses += [ipaddress.ip_interface(item.strip()) for item in value.split(",") if item.strip()]
+                continue
+            if key == "MTU":
+                mtu = int(value)
+                if not 576 <= mtu <= 65535:
+                    raise EncapError("Invalid MTU in WireGuard profile")
+                continue
+            if key in ("DNS", "Table", "PreUp", "PostUp", "PreDown", "PostDown", "SaveConfig"):
+                continue
+        lines.append(line)
+    if not addresses:
+        raise EncapError("WireGuard profile has no Address")
+    return "\n".join(lines) + "\n", addresses, mtu
+
+
+def wireguard_interface(profile):
+    marker = WIREGUARD_RUN / (pathlib.Path(profile).stem + ".name")
+    result = run(["sudo", "-n", "cat", str(marker)], check=False)
+    name = result.stdout.strip()
+    return name if not result.returncode and re.fullmatch(r"utun[0-9]+", name) else None
+
+
+def wireguard_up(config):
+    """Bring the profile up the way wg-quick does on macOS for Table = off and no DNS."""
+    profile = pathlib.Path(config["profile"])
+    settings, addresses, mtu = wireguard_settings(profile.read_text())
+    if profile_active(profile):
+        raise EncapError("WireGuard profile is already active")
+    marker = WIREGUARD_RUN / (profile.stem + ".name")
+    run(["sudo", "-n", "mkdir", "-p", str(WIREGUARD_RUN)])
+    run(["sudo", "-n", "/usr/bin/env", f"WG_TUN_NAME_FILE={marker}", config["wireguard_go"], "utun"], timeout=30)
+    try:
+        interface = None
+        for _ in range(30):
+            interface = wireguard_interface(profile)
+            if interface and (WIREGUARD_RUN / f"{interface}.sock").exists():
+                break
+            time.sleep(0.1)
+        else:
+            raise EncapError("WireGuard interface not found")
+        run(["sudo", "-n", config["wg"], "addconf", interface, "/dev/stdin"], input=settings)
+        for address in addresses:
+            family = "inet6" if address.version == 6 else "inet"
+            extra = [] if address.version == 6 else [str(address.ip)]
+            run(["sudo", "-n", "ifconfig", interface, family, str(address), *extra, "alias"])
+        if mtu is None:
+            default = field(route("default"), "interface")
+            found = re.search(r"mtu (\d+)", run(["ifconfig", default], check=False).stdout if default else "")
+            mtu = (int(found.group(1)) if found else 1500) - 80
+        run(["sudo", "-n", "ifconfig", interface, "mtu", str(mtu)])
+        run(["sudo", "-n", "ifconfig", interface, "up"])
+        return interface
+    except BaseException:
+        try:
+            wireguard_down(profile)
+        except EncapError as error:
+            log("warn", f"WireGuard cleanup: {error}")
+        raise
+
+
+def wireguard_down(profile):
+    """Same as wg-quick down: removing the control socket makes wireguard-go exit."""
+    marker = WIREGUARD_RUN / (pathlib.Path(profile).stem + ".name")
+    interface = wireguard_interface(profile)
+    if interface:
+        run(["sudo", "-n", "rm", "-f", str(WIREGUARD_RUN / f"{interface}.sock")], check=False)
+    run(["sudo", "-n", "rm", "-f", str(marker)], check=False)
+    for _ in range(50):
+        if not interface_exists(interface):
+            break
+        time.sleep(0.1)
+    if profile_active(profile):
+        raise EncapError("WireGuard marker remains")
+    if interface_exists(interface):
+        raise EncapError(f"WireGuard interface {interface} remains")
 
 
 def interface_exists(interface):
@@ -593,19 +769,10 @@ def recover(state, prompt=True):
             if result is not None and result.returncode and prefix_on_interface(prefix, interface):
                 errors.append(f"Route {prefix} remains")
     if profile_active(profile):
-        if profile.is_file():
-            result = attempt(["sudo", "-n", state["wg_quick"], "down", str(profile)], "WireGuard down", timeout=50)
-            if result is not None and result.returncode and profile_active(profile):
-                detail = (result.stderr or result.stdout).strip()[-250:]
-                if interface_exists(interface):
-                    errors.append(f"WireGuard down failed: {detail}")
-                else:
-                    marker = pathlib.Path("/var/run/wireguard", profile.stem + ".name")
-                    removed = attempt(["sudo", "-n", "rm", "-f", str(marker)], "Stale WireGuard marker")
-                    if removed is None or removed.returncode:
-                        errors.append(f"Stale WireGuard marker remains: {detail}")
-        else:
-            errors.append("WireGuard profile was removed")
+        try:
+            wireguard_down(profile)
+        except EncapError as error:
+            errors.append(f"WireGuard down failed: {error}")
     pid = state.get("relay_pid")
     if relay_alive(pid):
         os.kill(pid, signal.SIGTERM)
@@ -662,6 +829,7 @@ def connect(config):
         raise EncapError("This client currently supports macOS only")
     guard = lock(nonblocking=True)
     terminal = TerminalGuard().__enter__()
+    sleep_watch = None
     progress = ConnectionProgress()
     progress.start("Checking network", "1/4")
     try:
@@ -723,7 +891,6 @@ def connect(config):
             "original_dns_text": original_dns_text,
             "dns_servers": config["dns_servers"],
             "profile": config["profile"],
-            "wg_quick": config["wg_quick"],
             "host_route_owned": not redundant_route,
         }
         if config.get("access_header_file"):
@@ -734,8 +901,10 @@ def connect(config):
             signal.signal(sig, stop_signal)
         relay = None
         opened = None
+        asleep = False
         relay_messages = deque(maxlen=30)
         failure = None
+        sleep_watch = SleepWatcher().start()
         try:
             if redundant_route:
                 current = route(config["server_ip"])
@@ -793,11 +962,7 @@ def connect(config):
                 raise EncapError("WebSocket relay exited; check server HTTPS/443")
             log("info", "Starting WireGuard")
             progress.update("Starting tunnel", "3/4")
-            up = run(["sudo", "-n", config["wg_quick"], "up", config["profile"]], timeout=50)
-            match = re.search(r"Interface for [^\s]+ is (utun\d+)", up.stderr)
-            if not match:
-                raise EncapError("WireGuard interface not found")
-            interface = match.group(1)
+            interface = wireguard_up(config)
             log("debug", f"Tunnel interface: {interface}")
             state["tunnel_interface"] = interface
             save_state(state)
@@ -830,7 +995,8 @@ def connect(config):
                 print("Keep this window open. Press Ctrl+C to close the tunnel.", flush=True)
             last_refresh = time.monotonic()
             while True:
-                time.sleep(5)
+                if sleep_watch.sleeping.wait(5):
+                    raise MacSleeping()
                 current_default = route("default")
                 if relay.poll() is not None:
                     raise EncapError("WebSocket relay stopped")
@@ -849,6 +1015,10 @@ def connect(config):
         except KeyboardInterrupt:
             progress.pause()
             log("info", "Closing tunnel")
+        except MacSleeping:
+            progress.pause()
+            asleep = True
+            log("info", "Mac is going to sleep; closing tunnel")
         except BaseException as error:
             progress.pause()
             failure = error
@@ -862,16 +1032,21 @@ def connect(config):
             log("info", "Restoring network")
             progress.start("Closing tunnel")
             try:
-                recover(state, prompt=True)
+                # Asleep: never wait for a password while macOS holds the sleep.
+                recover(state, prompt=not asleep)
             except BaseException as error:
                 progress.pause()
                 raise EncapError(f"Restore incomplete: {error}. Run: encap stop") from error
+            finally:
+                sleep_watch.release()
             progress.pause()
             if opened:
-                print(tunnel_line(False, None, opened), flush=True)
+                print(tunnel_line(False, None, opened, note="mac went to sleep" if asleep else None), flush=True)
         if failure:
             raise EncapError(str(failure))
     finally:
+        if sleep_watch:
+            sleep_watch.stop()
         progress.pause()
         terminal.__exit__(None, None, None)
         os.close(guard)
@@ -1141,9 +1316,8 @@ def enroll_public(server, path):
         if target.exists():
             raise EncapError("Already enrolled")
         wg = resolve_binary("wg")
-        resolve_binary("wg-quick")
         resolve_binary("wireguard-go")
-        wstunnel = resolve_binary("wstunnel")
+        resolve_binary("wstunnel")
         private_key = validated_key(run([wg, "genkey"]).stdout.strip())
         try:
             public_result = subprocess.run([wg, "pubkey"], input=private_key + "\n", capture_output=True, text=True, timeout=10)
@@ -1199,10 +1373,6 @@ def enroll_public(server, path):
             "dns_servers": ["1.1.1.1"],
             "expected_exit_ip": server_ip,
             "health_url": "https://example.org/",
-            "wstunnel": wstunnel,
-            "wg_quick": resolve_binary("wg-quick"),
-            "wg": wg,
-            "wireguard_go": resolve_binary("wireguard-go"),
         }
         try:
             write_private(profile, profile_text)
@@ -1230,8 +1400,10 @@ def main():
     parser.add_argument("--config", help="Config file path")
     parser.add_argument("--server", help="HTTPS server for first setup")
     parser.add_argument("--debug", action="store_true", help="Show details")
-    parser.add_argument("command", nargs="?", default="toggle", choices=("doctor", "connect", "status", "stop", "disconnect", "enroll", "uninstall"))
+    # No default here: some Python versions check a positional default against choices.
+    parser.add_argument("command", nargs="?", choices=("doctor", "connect", "status", "stop", "disconnect", "enroll", "uninstall"))
     args = parser.parse_args()
+    args.command = args.command or "toggle"
     DEBUG = args.debug
     try:
         if args.command == "uninstall":
